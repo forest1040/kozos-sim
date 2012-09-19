@@ -1,0 +1,319 @@
+--- compile.c.orig	Thu Sep  9 20:56:30 2010
++++ compile.c	Thu Sep  9 21:11:12 2010
+@@ -34,40 +34,43 @@
+ #include "sys/stat.h"
+ #include "sys/types.h"
+ 
+ #ifndef SIGTRAP
+ # define SIGTRAP 5
+ #endif
+ 
+ int debug;
+ 
+ host_callback *sim_callback;
+ 
+ static SIM_OPEN_KIND sim_kind;
+ static char *myname;
+ 
+ /* FIXME: Needs to live in header file.
+    This header should also include the things in remote-sim.h.
+    One could move this to remote-sim.h but this function isn't needed
+    by gdb.  */
+ static void set_simcache_size (SIM_DESC, int);
+ 
++extern void sim_device_init (host_callback *sim_callback, unsigned char *memory);
++extern int sim_device_run (host_callback *sim_callback, unsigned char *memory);
++
+ #define X(op, size)  (op * 4 + size)
+ 
+ #define SP (h8300hmode && !h8300_normal_mode ? SL : SW)
+ 
+ #define h8_opcodes ops
+ #define DEFINE_TABLE
+ #include "opcode/h8300.h"
+ 
+ /* CPU data object: */
+ 
+ static int
+ sim_state_initialize (SIM_DESC sd, sim_cpu *cpu)
+ {
+   /* FIXME: not really necessary, since sim_cpu_alloc calls zalloc.  */
+ 
+   memset (&cpu->regs, 0, sizeof(cpu->regs));
+   cpu->regs[SBR_REGNUM] = 0xFFFFFF00;
+   cpu->pc = 0;
+   cpu->delayed_branch = 0;
+   cpu->memory = NULL;
+@@ -1896,40 +1899,41 @@
+ void
+ sim_resume (SIM_DESC sd, int step, int siggnal)
+ {
+   static int init1;
+   int cycles = 0;
+   int insts = 0;
+   int tick_start = get_now ();
+   void (*prev) ();
+   int poll_count = 0;
+   int res;
+   int tmp;
+   int rd;
+   int ea;
+   int bit;
+   int pc;
+   int c, nz, v, n, u, h, ui, intMaskBit;
+   int trace, intMask;
+   int oldmask;
+   enum sim_stop reason;
+   int sigrc;
++  int vec;
+ 
+   init_pointers (sd);
+ 
+   control_c_sim_desc = sd;
+   prev = signal (SIGINT, control_c);
+ 
+   if (step)
+     {
+       sim_engine_set_run_state (sd, sim_stopped, SIGTRAP);
+     }
+   else
+     {
+       sim_engine_set_run_state (sd, sim_running, 0);
+     }
+ 
+   pc = h8_get_pc (sd);
+ 
+   /* The PC should never be odd.  */
+   if (pc & 0x1)
+     {
+@@ -1954,40 +1958,85 @@
+       unsigned short cidx;
+       decoded_inst *code;
+ 
+     top:
+       cidx = h8_get_cache_idx (sd, pc);
+       if (cidx == (unsigned short) -1 ||
+ 	  cidx >= sd->sim_cache_size)
+ 	goto illegal;
+ 	  
+       code = sd->sim_cache + cidx;
+ 
+ #if ADEBUG
+       if (debug)
+ 	{
+ 	  printf ("%x %d %s\n", pc, code->opcode,
+ 		  code->op ? code->op->name : "**");
+ 	}
+       h8_increment_stats (sd, code->opcode);
+ #endif
+ 
++      vec = sim_device_run (sim_callback, h8_get_memory_buf(sd));
++      if (vec && !intMaskBit)
++	{
++	  tmp = h8_get_reg (sd, SP_REGNUM);
++	  if(h8300_normal_mode)
++	    {
++	      tmp -= 2;
++	      SET_MEMORY_W (tmp, code->next_pc);
++	      tmp -= 2;
++	      SET_MEMORY_W (tmp, h8_get_ccr (sd));
++	    }
++	  else
++	    {
++#if 0
++	      tmp -= 4;
++	      SET_MEMORY_L (tmp, code->next_pc);
++	      tmp -= 4;
++	      SET_MEMORY_L (tmp, h8_get_ccr (sd));
++#else
++	      tmp -= 4;
++#if 0
++	      SET_MEMORY_L (tmp, (h8_get_ccr (sd) << 24) | (code->next_pc & 0xffffff));
++#else
++	      SET_MEMORY_L (tmp, (h8_get_ccr (sd) << 24) | (pc & 0xffffff));
++#endif
++#endif
++	    }
++	  intMaskBit = 1;
++	  BUILDSR (sd);
++
++	  if (h8300smode)
++	    {
++	      tmp -= 4;
++	      SET_MEMORY_L (tmp, h8_get_exr (sd));
++	    }
++
++	  h8_set_reg (sd, SP_REGNUM, tmp);
++
++	  if(h8300_normal_mode)
++	    pc = GET_MEMORY_L (vec * 2);
++	  else
++	    pc = GET_MEMORY_L (vec * 4);
++	  goto end;
++	}
++
+       if (code->opcode)
+ 	{
+ 	  cycles += code->cycles;
+ 	  insts++;
+ 	}
+ 
+       switch (code->opcode)
+ 	{
+ 	case 0:
+ 	  /*
+ 	   * This opcode is a fake for when we get to an
+ 	   * instruction which hasnt been compiled
+ 	   */
+ 	  compile (sd, pc);
+ 	  goto top;
+ 	  break;
+ 
+ 	case O (O_MOVAB, SL):
+ 	case O (O_MOVAW, SL):
+ 	case O (O_MOVAL, SL):
+@@ -3569,44 +3618,51 @@
+ 	case O (O_BSR, SW):
+ 	case O (O_BSR, SL):
+ 	case O (O_BSR, SB):		/* bsr, branch to subroutine */
+ 	  if (fetch (sd, &code->src, &res))
+ 	    goto end;
+ 	  pc = code->next_pc + res;
+ 	  goto call;
+ 
+ 	case O (O_RTE, SN):		/* rte, return from exception */
+ 	rte:
+ 	  /* Pops exr and ccr before pc -- otherwise identical to rts.  */
+ 	  tmp = h8_get_reg (sd, SP_REGNUM);
+ 
+ 	  if (h8300smode)			/* pop exr */
+ 	    {
+ 	      h8_set_exr (sd, GET_MEMORY_L (tmp));
+ 	      tmp += 4;
+ 	    }
+ 	  if (h8300hmode && !h8300_normal_mode)
+ 	    {
++#if 0
+ 	      h8_set_ccr (sd, GET_MEMORY_L (tmp));
+ 	      tmp += 4;
+ 	      pc = GET_MEMORY_L (tmp);
+ 	      tmp += 4;
++#else
++	      pc = GET_MEMORY_L (tmp);
++	      h8_set_ccr (sd, (pc >> 24) & 0xff);
++	      pc &= 0xffffff;
++	      tmp += 4;
++#endif
+ 	    }
+ 	  else
+ 	    {
+ 	      h8_set_ccr (sd, GET_MEMORY_W (tmp));
+ 	      tmp += 2;
+ 	      pc = GET_MEMORY_W (tmp);
+ 	      tmp += 2;
+ 	    }
+ 
+ 	  GETSR (sd);
+ 	  h8_set_reg (sd, SP_REGNUM, tmp);
+ 	  goto end;
+ 
+ 	case O (O_RTS, SN):		/* rts, return from subroutine */
+ 	rts:
+ 	  tmp = h8_get_reg (sd, SP_REGNUM);
+ 
+ 	  if (h8300hmode && !h8300_normal_mode)
+ 	    {
+ 	      pc = GET_MEMORY_L (tmp);
+@@ -3650,44 +3706,49 @@
+ 	    {
+ 	      /* Treat it as a sigtrap.  */
+ 	      sim_engine_set_run_state (sd, sim_stopped, SIGTRAP);
+ 	    }
+ 	  goto end;
+ 
+ 	case O (O_TRAPA, SB):		/* trapa */
+ 	  if (fetch (sd, &code->src, &res))
+    	    goto end;			/* res is vector number.  */
+   
+    	  tmp = h8_get_reg (sd, SP_REGNUM);
+    	  if(h8300_normal_mode)
+    	    {
+    	      tmp -= 2;
+    	      SET_MEMORY_W (tmp, code->next_pc);
+    	      tmp -= 2;
+    	      SET_MEMORY_W (tmp, h8_get_ccr (sd));
+    	    }
+    	  else
+    	    {
++#if 0
+    	      tmp -= 4;
+    	      SET_MEMORY_L (tmp, code->next_pc);
+    	      tmp -= 4;
+    	      SET_MEMORY_L (tmp, h8_get_ccr (sd));
++#else
++	      tmp -= 4;
++	      SET_MEMORY_L (tmp, (h8_get_ccr (sd) << 24) | (code->next_pc & 0xffffff));
++#endif
+    	    }
+    	  intMaskBit = 1;
+    	  BUILDSR (sd);
+  
+ 	  if (h8300smode)
+ 	    {
+ 	      tmp -= 4;
+ 	      SET_MEMORY_L (tmp, h8_get_exr (sd));
+ 	    }
+ 
+ 	  h8_set_reg (sd, SP_REGNUM, tmp);
+ 
+ 	  if(h8300_normal_mode)
+ 	    pc = GET_MEMORY_L (0x10 + res * 2); /* Vector addresses are 0x10,0x12,0x14 and 0x16 */
+ 	  else
+ 	    pc = GET_MEMORY_L (0x20 + res * 4);
+ 	  goto end;
+ 
+ 	case O (O_BPT, SN):
+ 	  sim_engine_set_run_state (sd, sim_stopped, SIGTRAP);
+@@ -5038,40 +5099,42 @@
+   if (h8_get_cache_idx_buf (sd))
+     free (h8_get_cache_idx_buf (sd));
+   if (h8_get_eightbit_buf (sd))
+     free (h8_get_eightbit_buf (sd));
+ 
+   h8_set_memory_buf (sd, (unsigned char *) 
+ 		     calloc (sizeof (char), memory_size));
+   h8_set_cache_idx_buf (sd, (unsigned short *) 
+ 			calloc (sizeof (short), memory_size));
+   sd->memory_size = memory_size;
+   h8_set_eightbit_buf (sd, (unsigned char *) calloc (sizeof (char), 256));
+ 
+   /* `msize' must be a power of two.  */
+   if ((memory_size & (memory_size - 1)) != 0)
+     {
+       (*sim_callback->printf_filtered) (sim_callback, 
+ 					"sim_load: bad memory size.\n");
+       return SIM_RC_FAIL;
+     }
+   h8_set_mask (sd, memory_size - 1);
++
++  sim_device_init (sim_callback, h8_get_memory_buf (sd));
+ 
+   if (sim_load_file (sd, myname, sim_callback, prog, prog_bfd,
+ 		     sim_kind == SIM_OPEN_DEBUG,
+ 		     0, sim_write)
+       == NULL)
+     {
+       /* Close the bfd if we opened it.  */
+       if (abfd == NULL && prog_bfd != NULL)
+ 	bfd_close (prog_bfd);
+       return SIM_RC_FAIL;
+     }
+ 
+   /* Close the bfd if we opened it.  */
+   if (abfd == NULL && prog_bfd != NULL)
+     bfd_close (prog_bfd);
+   return SIM_RC_OK;
+ }
+ 
+ SIM_RC
+ sim_create_inferior (SIM_DESC sd, struct bfd *abfd, char **argv, char **env)
