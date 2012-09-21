@@ -3,7 +3,8 @@
 シミュレータ環境は、gdbのCPUエミュレーション機能を使用します。
 
 ##参考URL
-((http://kozos.jp/kozos/h8_sim_01.html "(シミュレータ編第１回)とりあえず動かしてみた"))
+([シミュレータ](http://kozos.jp/kozos/h8_sim_01.html "(シミュレータ編第１回)とりあえず動かしてみた"))
+([shutdown -h now](http://d.hatena.ne.jp/forest1040/20120921/1348191532 "H8のシミュレータ環境"))
 
 ##手順
 * gdb-7.2.tar.gzをダウンロードして展開
